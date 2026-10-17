@@ -41,6 +41,14 @@ FIXTURE_DATA_PATH = Path(__file__).resolve().parent.parent / "fixtures"
                 {"provider_a": None, "provider_b": "218500"},  # unused sub, not in A
                 {"provider_a": "27889", "provider_b": "33135"},  # naive name matching
                 {"provider_a": "13556", "provider_b": "5041"},  # no birth date
+                {
+                    "provider_a": "74259",
+                    "provider_b": None,
+                },  # conflicting birth date (1998-02-02 vs 1998-07-18)
+                {
+                    "provider_a": None,
+                    "provider_b": "273718",
+                },  # conflicting birth date (1998-02-02 vs 1998-07-18)
             ],
         ),
         # disjoint player sets between data providers

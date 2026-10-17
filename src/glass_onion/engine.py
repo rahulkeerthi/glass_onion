@@ -184,6 +184,75 @@ class SyncEngine:
         self.object_type = object_type
         self.verbose = verbose
         self.join_columns = join_columns
+        self._pruned_node_pairs: set[frozenset[Tuple[str, Any]]] = set()
+
+    def nodes_conflict(self, node_a: Tuple[str, Any], node_b: Tuple[str, Any]) -> bool:
+        """
+        Returns True if two `(id_field, id)` nodes cannot belong to the same synchronized row.
+
+        Subclasses can override this to enforce domain-specific compatibility invariants (e.g., player birth date conflicts) when merging pairs across multiple providers or deduplicating rows.
+        """
+        return False
+
+    def nodes_are_exact_match(
+        self, node_a: Tuple[str, Any], node_b: Tuple[str, Any]
+    ) -> bool:
+        """
+        Returns True if a link between two `(id_field, id)` nodes is backed by exact, non-placeholder identifying metadata.
+
+        Used by `synchronize_all_combinations()` and `synchronize()` to union exact links before evaluating fuzzy or incomplete intermediate links.
+        """
+        return True
+
+    def _find_conflict_edges(
+        self,
+        edges: list[Tuple[Any, Any]],
+        conflict_fn: Any,
+    ) -> set[int]:
+        adj: dict[Any, list[Tuple[Any, int]]] = {}
+        for idx, (u, v) in enumerate(edges):
+            adj.setdefault(u, []).append((v, idx))
+            adj.setdefault(v, []).append((u, idx))
+
+        bad_edges: set[int] = set()
+        seen: set[Any] = set()
+        for start in adj:
+            if start in seen:
+                continue
+            comp: list[Any] = []
+            queue = [start]
+            seen.add(start)
+            while queue:
+                curr = queue.pop()
+                comp.append(curr)
+                for nxt, _ in adj[curr]:
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        queue.append(nxt)
+
+            conflict_pairs = [
+                (comp[i], comp[j])
+                for i in range(len(comp))
+                for j in range(i + 1, len(comp))
+                if conflict_fn(comp[i], comp[j])
+            ]
+            for src, dst in conflict_pairs:
+                visited = {src}
+
+                def dfs(curr: Any, path_edges: list[int]) -> None:
+                    if curr == dst:
+                        bad_edges.update(path_edges)
+                        return
+                    for nxt, edge_idx in adj[curr]:
+                        if nxt not in visited:
+                            visited.add(nxt)
+                            path_edges.append(edge_idx)
+                            dfs(nxt, path_edges)
+                            path_edges.pop()
+                            visited.remove(nxt)
+
+                dfs(src, [])
+        return bad_edges
 
     def verbose_log(self, msg: Any):
         """
@@ -520,19 +589,65 @@ class SyncEngine:
 
         id_fields = [c.id_field for c in content]
 
-        # union-find over (id_field, id) nodes. Each root tracks the id_fields in its group
-        # so that a link can't merge two identifiers from the same provider.
+        # union-find over (id_field, id) nodes. Each root tracks the id_fields and nodes in its group
+        # so that a link can't merge two identifiers from the same provider or two conflicting records.
         parent: dict[Tuple[str, Any], Tuple[str, Any]] = {}
         group_fields: dict[Tuple[str, Any], set[str]] = {}
+        group_nodes: dict[Tuple[str, Any], set[Tuple[str, Any]]] = {}
 
         def find(node: Tuple[str, Any]) -> Tuple[str, Any]:
             parent.setdefault(node, node)
             group_fields.setdefault(node, {node[0]})
+            group_nodes.setdefault(node, {node})
             while parent[node] != node:
                 parent[node] = parent[parent[node]]
                 node = parent[node]
             return node
 
+        def peek_root(node: Tuple[str, Any]) -> Tuple[str, Any]:
+            return find(node) if node in parent else node
+
+        def peek_nodes(root: Tuple[str, Any]) -> set[Tuple[str, Any]]:
+            return group_nodes[root] if root in group_nodes else {root}
+
+        def pair_conflicts(node_x: Tuple[str, Any], node_y: Tuple[str, Any]) -> bool:
+            return frozenset(
+                (node_x, node_y)
+            ) in self._pruned_node_pairs or self.nodes_conflict(node_x, node_y)
+
+        def domain_conflict(
+            nodes_x: set[Tuple[str, Any]], nodes_y: set[Tuple[str, Any]]
+        ) -> bool:
+            return any(pair_conflicts(u, v) for u in nodes_x for v in nodes_y)
+
+        def try_union(node_x: Tuple[str, Any], node_y: Tuple[str, Any]) -> None:
+            if pair_conflicts(node_x, node_y):
+                self.verbose_log(
+                    f"Skipping link {node_x} <-> {node_y}: conflicting records"
+                )
+                return
+            root_x = peek_root(node_x)
+            root_y = peek_root(node_y)
+            if root_x == root_y:
+                return
+            fields_x = group_fields.get(root_x, {root_x[0]})
+            fields_y = group_fields.get(root_y, {root_y[0]})
+            if fields_x & fields_y:
+                self.verbose_log(
+                    f"Skipping link {node_x} <-> {node_y}: would put two identifiers from the same provider in one row"
+                )
+                return
+            if domain_conflict(peek_nodes(root_x), peek_nodes(root_y)):
+                self.verbose_log(
+                    f"Skipping link {node_x} <-> {node_y}: would put conflicting records in one row"
+                )
+                return
+            rx, ry = find(node_x), find(node_y)
+            parent[ry] = rx
+            group_fields[rx] |= group_fields.pop(ry)
+            group_nodes[rx] |= group_nodes.pop(ry)
+
+        candidate_links: list[Tuple[Tuple[str, Any], Tuple[str, Any]]] = []
         for r in results:
             pair_fields = [f for f in id_fields if f in r.data.columns]
             for row in r.data[pair_fields].itertuples(index=False):
@@ -541,16 +656,45 @@ class SyncEngine:
                     continue
 
                 for node in nodes[1:]:
-                    root_x, root_y = find(nodes[0]), find(node)
-                    if root_x == root_y:
-                        continue
-                    if group_fields[root_x] & group_fields[root_y]:
-                        self.verbose_log(
-                            f"Skipping link {nodes[0]} <-> {node}: would put two identifiers from the same provider in one row"
-                        )
-                        continue
-                    parent[root_y] = root_x
-                    group_fields[root_x] |= group_fields.pop(root_y)
+                    candidate_links.append((nodes[0], node))
+
+        exact_links = [
+            (u, v) for u, v in candidate_links if self.nodes_are_exact_match(u, v)
+        ]
+        deferred_links = [
+            (u, v) for u, v in candidate_links if not self.nodes_are_exact_match(u, v)
+        ]
+
+        for u, v in exact_links:
+            try_union(u, v)
+
+        if len(deferred_links) > 0:
+            root_edges: list[Tuple[Tuple[str, Any], Tuple[str, Any]]] = []
+            valid_deferred: list[Tuple[Tuple[str, Any], Tuple[str, Any]]] = []
+            for u, v in deferred_links:
+                if pair_conflicts(u, v):
+                    continue
+                ru, rv = peek_root(u), peek_root(v)
+                if ru == rv:
+                    continue
+                if domain_conflict(peek_nodes(ru), peek_nodes(rv)):
+                    self._pruned_node_pairs.add(frozenset((u, v)))
+                    continue
+                root_edges.append((ru, rv))
+                valid_deferred.append((u, v))
+
+            bad_edge_indices = self._find_conflict_edges(
+                root_edges,
+                lambda r1, r2: domain_conflict(peek_nodes(r1), peek_nodes(r2)),
+            )
+            for idx, (u, v) in enumerate(valid_deferred):
+                if idx in bad_edge_indices:
+                    self._pruned_node_pairs.add(frozenset((u, v)))
+                    self.verbose_log(
+                        f"Skipping link {u} <-> {v}: lies on a path between conflicting records"
+                    )
+                    continue
+                try_union(u, v)
 
         groups: dict[Tuple[str, Any], dict[str, Any]] = {}
         for node in parent:
@@ -583,6 +727,109 @@ class SyncEngine:
         return SyncableContent(
             object_type=self.object_type, provider=content[0].provider, data=unified
         )
+
+    def _compute_dedupe_subgroups(
+        self, df: pd.DataFrame, id_mask: list[str]
+    ) -> pd.Series:
+        subgroups = pd.Series(0, index=df.index, dtype=int)
+        if len(df) <= 1:
+            return subgroups
+
+        present_id_fields = [f for f in id_mask if f in df.columns]
+        for _, group_df in df.groupby(self.join_columns, sort=False, dropna=False):
+            if len(group_df) <= 1:
+                continue
+
+            row_indices = list(group_df.index)
+            row_nodes: list[list[Tuple[str, Any]]] = []
+            row_id_maps: list[dict[str, Any]] = []
+            for _, row in group_df[present_id_fields].iterrows():
+                nodes = [(f, row[f]) for f in present_id_fields if pd.notna(row[f])]
+                row_nodes.append(nodes)
+                row_id_maps.append(dict(nodes))
+
+            n_rows = len(row_indices)
+
+            def rows_conflict(i: int, j: int) -> bool:
+                if any(
+                    frozenset((u, v)) in self._pruned_node_pairs
+                    or self.nodes_conflict(u, v)
+                    for u in row_nodes[i]
+                    for v in row_nodes[j]
+                ):
+                    return True
+                if len(row_nodes[i]) > 1 and len(row_nodes[j]) > 1:
+                    shared = set(row_id_maps[i].keys()) & set(row_id_maps[j].keys())
+                    if any(row_id_maps[i][f] != row_id_maps[j][f] for f in shared):
+                        return True
+                return False
+
+            if not any(
+                rows_conflict(i, j) for i in range(n_rows) for j in range(i + 1, n_rows)
+            ):
+                continue
+
+            parent = {i: i for i in range(n_rows)}
+            comp_rows = {i: {i} for i in range(n_rows)}
+
+            def find_row(i: int) -> int:
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
+
+            def comps_conflict(ri: int, rj: int) -> bool:
+                return any(
+                    rows_conflict(a, b) for a in comp_rows[ri] for b in comp_rows[rj]
+                )
+
+            def rows_exact(i: int, j: int) -> bool:
+                return (
+                    len(row_nodes[i]) > 0
+                    and len(row_nodes[j]) > 0
+                    and all(
+                        self.nodes_are_exact_match(u, v)
+                        for u in row_nodes[i]
+                        for v in row_nodes[j]
+                    )
+                )
+
+            for i in range(n_rows):
+                for j in range(i + 1, n_rows):
+                    if not rows_conflict(i, j) and rows_exact(i, j):
+                        ri, rj = find_row(i), find_row(j)
+                        if ri != rj and not comps_conflict(ri, rj):
+                            parent[rj] = ri
+                            comp_rows[ri] |= comp_rows.pop(rj)
+
+            deferred_pairs: list[Tuple[int, int]] = []
+            root_edges: list[Tuple[int, int]] = []
+            for i in range(n_rows):
+                for j in range(i + 1, n_rows):
+                    if rows_conflict(i, j) or rows_exact(i, j):
+                        continue
+                    ri, rj = find_row(i), find_row(j)
+                    if ri == rj or comps_conflict(ri, rj):
+                        continue
+                    deferred_pairs.append((i, j))
+                    root_edges.append((ri, rj))
+
+            bad_edges = self._find_conflict_edges(root_edges, comps_conflict)
+            for idx, (i, j) in enumerate(deferred_pairs):
+                if idx in bad_edges:
+                    continue
+                ri, rj = find_row(i), find_row(j)
+                if ri != rj and not comps_conflict(ri, rj):
+                    parent[rj] = ri
+                    comp_rows[ri] |= comp_rows.pop(rj)
+
+            root_to_sub: dict[int, int] = {}
+            for i, row_idx in enumerate(row_indices):
+                r = find_row(i)
+                sub_id = root_to_sub.setdefault(r, len(root_to_sub))
+                subgroups.loc[row_idx] = sub_id
+
+        return subgroups
 
     def synchronize_pair(
         self, input1: SyncableContent, input2: SyncableContent
@@ -624,7 +871,7 @@ class SyncEngine:
         2. Collect remaining unsynced rows and run the sync process on those. Append any newly synced rows to the result dataframe from Layer 1.
         3. Append any remaining unsynced rows to the bottom of the result data frame.
 
-        This result dataframe is then deduplicated: by default, the result dataframe is grouped by `SyncEngine.join_columns` and the first non-null result is selected for each data provider's identifier field.
+        This result dataframe is then deduplicated: by default, the result dataframe is grouped by `SyncEngine.join_columns` (splitting any group whose rows conflict on domain attributes or multi-provider synced cohorts) and the first non-null result is selected for each data provider's identifier field.
 
         The result dataframe is then wrapped in a SyncableContent object using the `provider` from the first SyncableContent object in `SyncEngine.content`.
 
@@ -638,6 +885,8 @@ class SyncEngine:
 
         if len(self.content) == 1:
             return self.content[0]
+
+        self._pruned_node_pairs = set()
 
         # first pass: straight matching - approach: agglomerative
         self.verbose_log(
@@ -720,8 +969,15 @@ class SyncEngine:
             k: (lambda x: x[x.notna()].iloc[0] if len(x[x.notna()]) > 0 else pd.NA)
             for k in id_mask
         }
+        synced.data = synced.data.copy()
+        synced.data["_dedupe_subgroup"] = self._compute_dedupe_subgroups(
+            synced.data, id_mask
+        )
         synced.data = (
-            synced.data.groupby(self.join_columns).agg(dedupe_aggregation).reset_index()
+            synced.data.groupby(self.join_columns + ["_dedupe_subgroup"])
+            .agg(dedupe_aggregation)
+            .reset_index()
+            .drop(columns=["_dedupe_subgroup"])
         )
         synced.data["provider"] = self.content[0].provider
         self.verbose_log(
