@@ -1,3 +1,4 @@
+from itertools import permutations
 from pathlib import Path
 from typing import Tuple
 import pandas as pd
@@ -9,6 +10,8 @@ from glass_onion.player import (
     PlayerSyncLayer,
     PlayerSyncSimilarityMethod,
     PlayerSyncableContent,
+    birth_dates_are_exact_match,
+    birth_dates_conflict,
 )
 import pytest
 
@@ -502,3 +505,578 @@ def test_synchronize_pair(
     assert isinstance(result, PlayerSyncableContent)
     assert len(result.data) == 1
     assert spy.call_count == expected_layers
+
+
+@pytest.mark.parametrize(
+    "a, b, expected",
+    [
+        # identical
+        ("1996-11-15", "1996-11-15", False),
+        # within 1 day (timezone shift)
+        ("1996-11-15", "1996-11-16", False),
+        ("1996-11-16", "1996-11-15", False),
+        # 2 days apart -> conflict
+        ("1996-11-15", "1996-11-17", True),
+        # different years -> conflict
+        ("1996-11-15", "2004-02-01", True),
+        # month/day swap (exact and within 1 day of swapped)
+        ("1996-11-05", "1996-05-11", False),
+        ("1996-05-11", "1996-11-05", False),
+        ("1996-11-05", "1996-05-12", False),
+        ("1996-11-05", "1996-05-13", True),
+        # swapping BOTH sides is a no-op and does not rescue a conflict
+        ("1996-03-04", "1996-03-06", True),
+        # Jan 1 in the same year (year-only placeholder)
+        ("1996-01-01", "1996-11-15", False),
+        ("1996-11-15", "1996-01-01", False),
+        # Jan 1 in a different year -> conflict (unless Dec 31 of the year before)
+        ("1997-01-01", "1996-11-15", True),
+        ("1997-01-01", "1996-12-31", False),
+        # timestamps with time of day / timezone: compare calendar dates
+        ("1996-11-15T23:00:00Z", "1996-11-16T01:00:00Z", False),
+        ("1996-11-15T23:00:00Z", "1996-11-17T00:00:00Z", True),
+        # missing, blank, unparseable, or epoch-zero sentinel (1970-01-01) -> no conflict
+        (pd.NA, "1996-11-15", False),
+        ("1996-11-15", None, False),
+        (pd.NA, pd.NA, False),
+        ("", "1996-11-15", False),
+        ("not-a-date", "1996-11-15", False),
+        ("1970-01-01", "1996-11-15", False),
+        ("1970-01-01T00:00:00Z", "1996-11-15", False),
+    ],
+)
+def test_birth_dates_conflict(a, b, expected: bool):
+    assert birth_dates_conflict(a, b) is expected
+
+
+@pytest.mark.parametrize(
+    "a, b, expected",
+    [
+        ("1996-11-15", "1996-11-15", True),
+        ("1996-11-15T00:00:00Z", "1996-11-15", True),
+        ("1996-11-15", "1996-11-16", False),
+        ("1996-11-05", "1996-05-11", False),
+        ("1996-01-01", "1996-01-01", False),
+        ("1996-01-01", "1996-11-15", False),
+        (pd.NA, "1996-11-15", False),
+        ("1970-01-01", "1970-01-01", False),
+    ],
+)
+def test_birth_dates_are_exact_match(a, b, expected: bool):
+    assert birth_dates_are_exact_match(a, b) is expected
+
+
+@pytest.mark.parametrize("na_value", [pd.NA, None])
+def test_init_syncable_content_all_null_optional_string_columns(na_value):
+    content = PlayerSyncableContent(
+        "provider_a",
+        pd.DataFrame(
+            [
+                {
+                    "provider_a_player_id": "1",
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": na_value,
+                    "team_id": "KOR",
+                    "birth_date": na_value,
+                    "jersey_number": na_value,
+                }
+            ]
+        ),
+    )
+    assert content.validate_data_schema()
+
+
+def test_synchronize_using_layer_does_not_mutate_inputs_and_normalizes_dates():
+    left = PlayerSyncableContent(
+        "provider_a",
+        data=pd.DataFrame(
+            [
+                {
+                    "provider_a_player_id": "1",
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Min-jae",
+                    "team_id": "KOR",
+                    "jersey_number": "3",
+                    "birth_date": "1996-11-15T00:00:00Z",
+                }
+            ]
+        ),
+    )
+    right = PlayerSyncableContent(
+        "provider_b",
+        data=pd.DataFrame(
+            [
+                {
+                    "provider_b_player_id": "2",
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Min-jae",
+                    "team_id": "KOR",
+                    "jersey_number": "4",
+                    "birth_date": "Nov 16, 1996",
+                }
+            ]
+        ),
+    )
+
+    engine = PlayerSyncEngine([left, right])
+    layer = PlayerSyncLayer(
+        title="Layer 2: +1d shift",
+        date_adjustment=pd.Timedelta(days=1),
+        swap_birth_month_day=False,
+    )
+    res = engine.synchronize_using_layer(left, right, layer)
+    assert len(res) == 1
+    # Neither input's birth_date column was mutated in-place
+    assert left.data["birth_date"].iloc[0] == "1996-11-15T00:00:00Z"
+    assert right.data["birth_date"].iloc[0] == "Nov 16, 1996"
+
+
+@pytest.mark.parametrize(
+    "left_row, right_rows, expected_matches",
+    [
+        # Layer 1 (same jersey + team + name) vetoed by conflicting birth dates
+        (
+            {
+                "player_name": "Kim Min-jae",
+                "player_nickname": "Kim Min-jae",
+                "jersey_number": "3",
+                "birth_date": "1996-11-15",
+            },
+            [
+                {
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Kim Min-jae",
+                    "jersey_number": "3",
+                    "birth_date": "2004-02-01",
+                }
+            ],
+            0,
+        ),
+        # Layer 3/4/5 (different jerseys) vetoed by conflicting birth dates
+        (
+            {
+                "player_name": "Kim Min-jae",
+                "player_nickname": "Min-jae",
+                "jersey_number": "3",
+                "birth_date": "1996-11-15",
+            },
+            [
+                {
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Min-jae",
+                    "jersey_number": "15",
+                    "birth_date": "2004-02-01",
+                }
+            ],
+            0,
+        ),
+        # Layer 5 (threshold=0 fallback on last unmatched players) vetoed by conflicting birth dates
+        (
+            {
+                "player_name": "Alice Smith",
+                "player_nickname": "Alice",
+                "jersey_number": pd.NA,
+                "birth_date": "1995-03-10",
+            },
+            [
+                {
+                    "player_name": "Bob Jones",
+                    "player_nickname": "Bob",
+                    "jersey_number": pd.NA,
+                    "birth_date": "2001-08-22",
+                }
+            ],
+            0,
+        ),
+        # Veto still applies when another row has a null birth_date (which disables Layer 2)
+        (
+            {
+                "player_name": "Kim Min-jae",
+                "player_nickname": "Min-jae",
+                "jersey_number": "3",
+                "birth_date": "1996-11-15",
+            },
+            [
+                {
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Min-jae",
+                    "jersey_number": "15",
+                    "birth_date": "2004-02-01",
+                },
+                {
+                    "player_name": "Unrelated Player",
+                    "player_nickname": "Unrelated",
+                    "jersey_number": "99",
+                    "birth_date": pd.NA,
+                },
+            ],
+            0,
+        ),
+        # Vetoing a conflicting homonym before 1-to-1 uniqueness check lets the true player match
+        (
+            {
+                "player_name": "Kim Min-jae",
+                "player_nickname": "Min-jae",
+                "jersey_number": pd.NA,
+                "birth_date": "1996-11-15",
+            },
+            [
+                {
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Min-jae",
+                    "jersey_number": pd.NA,
+                    "birth_date": "1996-11-15",
+                },
+                {
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Min-jae",
+                    "jersey_number": pd.NA,
+                    "birth_date": "2004-02-01",
+                },
+            ],
+            1,
+        ),
+        # Layer 2 +1 day adjustment (input1 + 1 day == input2)
+        (
+            {
+                "player_name": "Kim Min-jae",
+                "player_nickname": "Min-jae",
+                "jersey_number": "3",
+                "birth_date": "1996-11-15",
+            },
+            [
+                {
+                    "player_name": "K. Min-jae",
+                    "player_nickname": "Min-jae",
+                    "jersey_number": "4",
+                    "birth_date": "1996-11-16",
+                }
+            ],
+            1,
+        ),
+        # Layer 2 -1 day adjustment (input1 - 1 day == input2)
+        (
+            {
+                "player_name": "Kim Min-jae",
+                "player_nickname": "Min-jae",
+                "jersey_number": "3",
+                "birth_date": "1996-11-16",
+            },
+            [
+                {
+                    "player_name": "K. Min-jae",
+                    "player_nickname": "Min-jae",
+                    "jersey_number": "4",
+                    "birth_date": "1996-11-15",
+                }
+            ],
+            1,
+        ),
+        # Layer 2 month/day swap
+        (
+            {
+                "player_name": "Kim Min-jae",
+                "player_nickname": "Min-jae",
+                "jersey_number": "3",
+                "birth_date": "1996-11-05",
+            },
+            [
+                {
+                    "player_name": "K. Min-jae",
+                    "player_nickname": "Min-jae",
+                    "jersey_number": "4",
+                    "birth_date": "1996-05-11",
+                }
+            ],
+            1,
+        ),
+    ],
+)
+def test_synchronize_pair_birth_date_veto(
+    left_row: dict, right_rows: list[dict], expected_matches: int
+):
+    left = PlayerSyncableContent(
+        "provider_a",
+        data=pd.DataFrame([{"provider_a_player_id": "1", "team_id": "A", **left_row}]),
+    )
+    right = PlayerSyncableContent(
+        "provider_b",
+        data=pd.DataFrame(
+            [
+                {"provider_b_player_id": str(i + 1), "team_id": "A", **r}
+                for i, r in enumerate(right_rows)
+            ]
+        ),
+    )
+
+    engine = PlayerSyncEngine([left, right])
+    result = engine.synchronize_pair(left, right)
+    assert len(result.data) == expected_matches
+    assert left.data["birth_date"].iloc[0] == left_row["birth_date"]
+
+
+def test_synchronize_end_to_end_preserves_vetoed_homonyms_and_same_name_teammates():
+    # Two providers list different "Kim Min-jae" players (1996 vs 2004) without jersey numbers;
+    # synchronize() must keep them as two separate rows rather than collapsing them on join_columns.
+    left = PlayerSyncableContent(
+        "provider_a",
+        data=pd.DataFrame(
+            [
+                {
+                    "provider_a_player_id": "a_1996",
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Kim Min-jae",
+                    "team_id": "KOR",
+                    "jersey_number": pd.NA,
+                    "birth_date": "1996-11-15",
+                }
+            ]
+        ),
+    )
+    right = PlayerSyncableContent(
+        "provider_b",
+        data=pd.DataFrame(
+            [
+                {
+                    "provider_b_player_id": "b_2004",
+                    "player_name": "Kim Min-jae",
+                    "player_nickname": "Kim Min-jae",
+                    "team_id": "KOR",
+                    "jersey_number": pd.NA,
+                    "birth_date": "2004-02-01",
+                }
+            ]
+        ),
+    )
+
+    synced = PlayerSyncEngine([left, right]).synchronize().data
+    assert len(synced) == 2
+    assert (
+        len(synced.dropna(subset=["provider_a_player_id", "provider_b_player_id"])) == 0
+    )
+
+
+@pytest.mark.parametrize(
+    "order",
+    list(permutations(["provider_a", "provider_b", "provider_c"])),
+)
+def test_synchronize_three_provider_birth_date_drift_chain_rejected(
+    order: Tuple[str, ...],
+):
+    # A (15 Nov) <-> B (16 Nov) and B (16 Nov) <-> C (17 Nov) are each within 1 day,
+    # but A and C are 2 days apart and conflict; the chain must not merge A and C in any provider order.
+    dob_by_provider = {
+        "provider_a": "1996-11-15",
+        "provider_b": "1996-11-16",
+        "provider_c": "1996-11-17",
+    }
+    content = [
+        PlayerSyncableContent(
+            p,
+            data=pd.DataFrame(
+                [
+                    {
+                        f"{p}_player_id": f"{p}_1",
+                        "player_name": "Kim Min-jae",
+                        "player_nickname": "Kim Min-jae",
+                        "team_id": "KOR",
+                        "jersey_number": "3",
+                        "birth_date": dob_by_provider[p],
+                    }
+                ]
+            ),
+        )
+        for p in order
+    ]
+
+    synced = PlayerSyncEngine(content).synchronize().data
+    assert len(synced) == 3
+    for p in order:
+        assert synced[f"{p}_player_id"].notna().sum() == 1
+
+
+@pytest.mark.parametrize(
+    "order",
+    list(permutations(["provider_a", "provider_b", "provider_c"])),
+)
+@pytest.mark.parametrize(
+    "bridge_dob",
+    [pd.NA, "1996-01-01"],
+)
+def test_synchronize_three_provider_ambiguous_bridge_between_conflicting_players_rejected(
+    order: Tuple[str, ...],
+    bridge_dob,
+):
+    # Provider B has a missing or Jan-1 placeholder birth date and could pairwise-match both
+    # Provider A (1996-11-15) and Provider C (1996-05-20 / 2004-02-01), which conflict with each other.
+    dob_by_provider = {
+        "provider_a": "1996-11-15",
+        "provider_b": bridge_dob,
+        "provider_c": "1996-05-20" if pd.notna(bridge_dob) else "2004-02-01",
+    }
+    content = [
+        PlayerSyncableContent(
+            p,
+            data=pd.DataFrame(
+                [
+                    {
+                        f"{p}_player_id": f"{p}_1",
+                        "player_name": "Kim Min-jae",
+                        "player_nickname": "Kim Min-jae",
+                        "team_id": "KOR",
+                        "jersey_number": "3",
+                        "birth_date": dob_by_provider[p],
+                    }
+                ]
+            ),
+        )
+        for p in order
+    ]
+
+    synced = PlayerSyncEngine(content).synchronize().data
+    assert len(synced) == 3
+
+
+@pytest.mark.parametrize(
+    "order",
+    list(permutations(["provider_a", "provider_b", "provider_c", "provider_d"])),
+)
+def test_synchronize_four_provider_preserves_exact_cohort_when_bridge_conflicts(
+    order: Tuple[str, ...],
+):
+    # Providers A and D both have 1996-11-15 (exact match), Provider B has NA birth date,
+    # and Provider C has 2004-02-01 (conflict). A and D must unify while B and C stay separate.
+    dob_by_provider = {
+        "provider_a": "1996-11-15",
+        "provider_b": pd.NA,
+        "provider_c": "2004-02-01",
+        "provider_d": "1996-11-15",
+    }
+    content = [
+        PlayerSyncableContent(
+            p,
+            data=pd.DataFrame(
+                [
+                    {
+                        f"{p}_player_id": f"{p}_1",
+                        "player_name": "Kim Min-jae",
+                        "player_nickname": "Kim Min-jae",
+                        "team_id": "KOR",
+                        "jersey_number": "3",
+                        "birth_date": dob_by_provider[p],
+                    }
+                ]
+            ),
+        )
+        for p in order
+    ]
+
+    synced = PlayerSyncEngine(content).synchronize().data
+    assert len(synced) == 3
+    ad_row = synced[
+        (synced["provider_a_player_id"] == "provider_a_1")
+        & (synced["provider_d_player_id"] == "provider_d_1")
+    ]
+    assert len(ad_row) == 1
+    assert pd.isna(ad_row["provider_b_player_id"].iloc[0])
+    assert pd.isna(ad_row["provider_c_player_id"].iloc[0])
+
+
+@pytest.mark.parametrize(
+    "order",
+    list(permutations(["provider_a", "provider_b", "provider_c"])),
+)
+def test_synchronize_three_provider_compatible_missing_dob_bridge_unifies(
+    order: Tuple[str, ...],
+):
+    # Provider B has NA birth date and bridges Provider A (1996-11-15) and Provider C (1996-11-15);
+    # because A and C do not conflict, all three unify into a single row.
+    rows_by_provider = {
+        "provider_a": {
+            "player_name": "Timothy Weah",
+            "player_nickname": "Timothy Weah",
+            "jersey_number": "21",
+            "birth_date": "2000-02-22",
+        },
+        "provider_b": {
+            "player_name": "Timothy Weah",
+            "player_nickname": "T. Weah",
+            "jersey_number": "23",
+            "birth_date": pd.NA,
+        },
+        "provider_c": {
+            "player_name": "T. Weah",
+            "player_nickname": "T. Weah",
+            "jersey_number": "22",
+            "birth_date": "2000-02-22",
+        },
+    }
+    content = [
+        PlayerSyncableContent(
+            p,
+            data=pd.DataFrame(
+                [
+                    {
+                        f"{p}_player_id": f"{p}_1",
+                        "team_id": "USA",
+                        **rows_by_provider[p],
+                    }
+                ]
+            ),
+        )
+        for p in order
+    ]
+
+    synced = PlayerSyncEngine(content).synchronize().data
+    assert len(synced) == 1
+    for p in order:
+        assert synced[f"{p}_player_id"].iloc[0] == f"{p}_1"
+
+
+def test_synchronize_same_name_teammates_preserved_without_jersey_numbers():
+    # Two distinct teammates share player_name ("Tae-hyeon Kim") and team_id ("KOR"),
+    # and an unrelated player has jersey_number=NA (so join_columns drops jersey_number).
+    # Both Tae-hyeon Kim rows must survive final deduplication.
+    providers = ["provider_a", "provider_b", "provider_c"]
+    content = [
+        PlayerSyncableContent(
+            p,
+            data=pd.DataFrame(
+                [
+                    {
+                        f"{p}_player_id": f"{p}_1996",
+                        "player_name": "Tae-hyeon Kim",
+                        "player_nickname": "Tae-hyeon Kim",
+                        "team_id": "KOR",
+                        "jersey_number": "4",
+                        "birth_date": "1996-12-19",
+                    },
+                    {
+                        f"{p}_player_id": f"{p}_2000",
+                        "player_name": "Tae-hyeon Kim",
+                        "player_nickname": "Tae-hyeon Kim",
+                        "team_id": "KOR",
+                        "jersey_number": "15",
+                        "birth_date": "2000-09-17",
+                    },
+                    {
+                        f"{p}_player_id": f"{p}_other",
+                        "player_name": "Son Heung-min",
+                        "player_nickname": "Son",
+                        "team_id": "KOR",
+                        "jersey_number": pd.NA,
+                        "birth_date": "1992-07-08",
+                    },
+                ]
+            ),
+        )
+        for p in providers
+    ]
+
+    synced = PlayerSyncEngine(content).synchronize().data
+    kim_rows = synced[synced["player_name"] == "Tae-hyeon Kim"]
+    assert len(kim_rows) == 2
+    assert set(kim_rows["provider_a_player_id"]) == {
+        "provider_a_1996",
+        "provider_a_2000",
+    }

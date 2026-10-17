@@ -4,10 +4,77 @@ import pandas as pd
 import pandera.pandas as pa
 from pandera import Field, Column
 from pandera.typing import Series
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from glass_onion.engine import SyncableContent, SyncEngine
 from glass_onion.utils import dataframe_coalesce
+
+
+def _parse_birth_date(value: Any) -> Optional[pd.Timestamp]:
+    if value is None or (pd.api.types.is_scalar(value) and pd.isna(value)):
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    if parsed.tzinfo is not None:
+        if parsed == pd.Timestamp(0, tz="UTC"):
+            return None
+    elif parsed == pd.Timestamp(0):
+        return None
+    return pd.Timestamp(parsed.date())
+
+
+def birth_dates_conflict(a: Any, b: Any) -> bool:
+    """
+    Returns True if two birth dates are both present and cannot plausibly refer to the same player.
+
+    Two birth dates are considered compatible (not conflicting) if:
+    - either value is missing, unparseable, or the epoch-zero sentinel (`1970-01-01`);
+    - their calendar dates are within 1 day of each other (`abs(x - y) <= 1 day`);
+    - they share the same birth year and either date is January 1 (`YYYY-01-01`, a common year-only placeholder);
+    - swapping month and day on one date (when its day is `<= 12`) brings the two dates within 1 day.
+    """
+    x = _parse_birth_date(a)
+    y = _parse_birth_date(b)
+    if x is None or y is None:
+        return False
+
+    one_day = pd.Timedelta(days=1)
+    if abs(x - y) <= one_day:
+        return False
+
+    if x.year == y.year and (
+        (x.month == 1 and x.day == 1) or (y.month == 1 and y.day == 1)
+    ):
+        return False
+
+    x_swapped = (
+        pd.Timestamp(year=x.year, month=x.day, day=x.month) if x.day <= 12 else None
+    )
+    y_swapped = (
+        pd.Timestamp(year=y.year, month=y.day, day=y.month) if y.day <= 12 else None
+    )
+    if x_swapped is not None and abs(x_swapped - y) <= one_day:
+        return False
+    if y_swapped is not None and abs(x - y_swapped) <= one_day:
+        return False
+
+    return True
+
+
+def birth_dates_are_exact_match(a: Any, b: Any) -> bool:
+    """
+    Returns True if both birth dates are known, non-placeholder calendar dates and are identical (`x == y`).
+    """
+    x = _parse_birth_date(a)
+    y = _parse_birth_date(b)
+    if x is None or y is None:
+        return False
+    if (x.month == 1 and x.day == 1) or (y.month == 1 and y.day == 1):
+        return False
+    return x == y
 
 
 class PlayerDataSchema(pa.DataFrameModel):
@@ -40,9 +107,11 @@ class PlayerDataSchema(pa.DataFrameModel):
 
     @pa.check("birth_date")
     def is_valid_yyyy_mm_dd_date(self, series: Series[str]) -> bool:
+        non_null = series.dropna()
+        if len(non_null) == 0:
+            return True
         return (
-            series.dropna()
-            .apply(lambda x: pd.Timestamp(x))
+            non_null.apply(lambda x: pd.Timestamp(x))
             .apply(lambda x: x != pd.Timestamp(0))
             .all()
         )
@@ -66,6 +135,16 @@ class PlayerSyncableContent(SyncableContent):
         Returns:
             True, if `data` is formatted properly.
         """
+        for col in ("player_nickname", "birth_date"):
+            if (
+                isinstance(self.data, pd.DataFrame)
+                and col in self.data.columns
+                and len(self.data) > 0
+                and self.data[col].isna().all()
+            ):
+                self.data = self.data.copy()
+                self.data[col] = self.data[col].astype("string")
+
         (
             PlayerDataSchema.to_schema()
             .add_columns(
@@ -154,6 +233,8 @@ class PlayerSyncEngine(SyncEngine):
         """
         join_cols = ["jersey_number", "team_id", "player_name"]
         super().__init__("player", content, join_cols, verbose)
+        self._node_birth_dates: dict[Tuple[str, Any], Any] = {}
+        self._index_birth_dates(content)
         # check if certain columns are empty / unreliable
         original_join_columns = join_cols.copy()
         for j in original_join_columns:
@@ -174,6 +255,28 @@ class PlayerSyncEngine(SyncEngine):
 
         assert len(join_cols) > 0, "No join columns remaining to use for aggregation."
         self.join_columns = join_cols
+
+    def _index_birth_dates(self, content: list[SyncableContent]) -> None:
+        for c in content:
+            if "birth_date" not in c.data.columns:
+                continue
+            for row_id, dob in zip(c.data[c.id_field], c.data["birth_date"]):
+                if pd.notna(row_id) and pd.notna(dob):
+                    self._node_birth_dates.setdefault((c.id_field, row_id), dob)
+
+    def nodes_conflict(self, node_a: Tuple[str, Any], node_b: Tuple[str, Any]) -> bool:
+        return birth_dates_conflict(
+            self._node_birth_dates.get(node_a),
+            self._node_birth_dates.get(node_b),
+        )
+
+    def nodes_are_exact_match(
+        self, node_a: Tuple[str, Any], node_b: Tuple[str, Any]
+    ) -> bool:
+        return birth_dates_are_exact_match(
+            self._node_birth_dates.get(node_a),
+            self._node_birth_dates.get(node_b),
+        )
 
     def synchronize_using_layer(
         self,
@@ -203,16 +306,6 @@ class PlayerSyncEngine(SyncEngine):
         self.verbose_log(f"Input 1 Columns: {input1.data.columns.to_list()}")
         self.verbose_log(f"Input 2 Columns: {input2.data.columns.to_list()}")
 
-        if (
-            layer.date_adjustment is not None
-            and "birth_date" in input1.data.columns
-            and "birth_date" in input2.data.columns
-        ):
-            date_format = "%Y-%d-%m" if layer.swap_birth_month_day else "%Y-%m-%d"
-            input1.data.birth_date = (
-                pd.to_datetime(input1.data.birth_date) + layer.date_adjustment
-            ).dt.strftime(date_format)
-
         if layer.match_methodology == PlayerSyncSimilarityMethod.NAIVE:
             match_result = self.synchronize_with_naive_match(
                 input1, input2, fields=layer.input_fields
@@ -233,23 +326,48 @@ class PlayerSyncEngine(SyncEngine):
             )
 
         actual_available_fields = (
-            input1.data.columns[
-                input1.data.columns.isin(layer.other_equal_fields)
-            ].to_list()
+            [
+                f
+                for f in layer.other_equal_fields
+                if f in input1.data.columns and f in input2.data.columns
+            ]
             if len(layer.other_equal_fields) > 0
             else []
         )
         if len(actual_available_fields) > 0:
+            input1_fields = input1.data[
+                [input1.id_field] + actual_available_fields
+            ].copy()
+            input2_fields = input2.data[
+                [input2.id_field] + actual_available_fields
+            ].copy()
+            if "birth_date" in actual_available_fields:
+                input2_fields["birth_date"] = pd.to_datetime(
+                    input2_fields["birth_date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                if layer.date_adjustment is not None:
+                    date_format = (
+                        "%Y-%d-%m" if layer.swap_birth_month_day else "%Y-%m-%d"
+                    )
+                    input1_fields["birth_date"] = (
+                        pd.to_datetime(input1_fields["birth_date"], errors="coerce")
+                        + layer.date_adjustment
+                    ).dt.strftime(date_format)
+                else:
+                    input1_fields["birth_date"] = pd.to_datetime(
+                        input1_fields["birth_date"], errors="coerce"
+                    ).dt.strftime("%Y-%m-%d")
+
             match_result = pd.merge(
                 match_result,
-                input1.data[[input1.id_field] + actual_available_fields],
+                input1_fields,
                 how="inner",
                 on=input1.id_field,
             ).rename({k: f"input1_{k}" for k in actual_available_fields}, axis=1)
 
             match_result = pd.merge(
                 match_result,
-                input2.data[[input2.id_field] + actual_available_fields],
+                input2_fields,
                 how="inner",
                 on=input2.id_field,
             ).rename({k: f"input2_{k}" for k in actual_available_fields}, axis=1)
@@ -258,6 +376,26 @@ class PlayerSyncEngine(SyncEngine):
                 match_result = match_result[
                     match_result[f"input1_{f}"] == match_result[f"input2_{f}"]
                 ]
+
+        if (
+            len(match_result) > 0
+            and "birth_date" in input1.data.columns
+            and "birth_date" in input2.data.columns
+        ):
+            dob1 = input1.data.drop_duplicates(subset=input1.id_field).set_index(
+                input1.id_field
+            )["birth_date"]
+            dob2 = input2.data.drop_duplicates(subset=input2.id_field).set_index(
+                input2.id_field
+            )["birth_date"]
+            conflicts = [
+                birth_dates_conflict(a, b)
+                for a, b in zip(
+                    match_result[input1.id_field].map(dob1),
+                    match_result[input2.id_field].map(dob2),
+                )
+            ]
+            match_result = match_result[~pd.Series(conflicts, index=match_result.index)]
 
         # edge case: detect whether one player has been matched to multiple other players (somehow)
         input1_summary = (
@@ -302,10 +440,12 @@ class PlayerSyncEngine(SyncEngine):
 
         Methodology:
             1. Attempt to join pair using `player_name` with a minimum 75% cosine similarity threshold for player name. Additionally, require that `jersey_number` and `team_id` are equal for matches that meet the similarity threshold.
-            2. Account for players with different birth dates across data providers (timezones, human error, etc) by adjusting `birth_date` in one dataset in the pair by -1 to 1 days and/or swapping the month and day, then attempting synchronization using `birth_date`, `team_id`, and a combination of `player_name` and `player_nickname`. This process is then repeated for the other dataset in the pair.
+            2. Account for players with different birth dates across data providers (timezones, human error, etc) by adjusting `birth_date` in the first dataset in the pair by -1 to 1 days and/or swapping the month and day, then attempting synchronization using `birth_date`, `team_id`, and a combination of `player_name` and `player_nickname`.
             3. Attempt to join remaining records using combinations of `player_name` and `player_nickname` with a minimum 75% cosine similarity threshold for player name. Additionally, require that `team_id` is equal for matches that meet the similarity threshold.
             4. Attempt to join remaining records using "naive similarity": looking for normalized parts of one record's `player name` (or `player_nickname`) that exist in another's. Additionally, require that `team_id` is equal for matches found via this method.
             5. Attempt to join remaining records using combinations of `player_name` and `player_nickname` with no minimum cosine similarity threshold. Additionally, require that `team_id` is equal.
+
+        In every layer, proposed pairs whose birth dates conflict (see [birth_dates_conflict()][glass_onion.player.birth_dates_conflict]) are dropped.
 
         Args:
             input1 (glass_onion.SyncableContent): a PlayerSyncableContent object from `PlayerSyncEngine.content`
@@ -323,6 +463,8 @@ class PlayerSyncEngine(SyncEngine):
         if len(input1.data) > 0 and len(input2.data) == 0:
             input1.data[input2.id_field] = pd.NA
             return input1
+
+        self._index_birth_dates([input1, input2])
 
         # first layer: cosine similarity x jersey number x team
         self.verbose_log(
@@ -380,7 +522,7 @@ class PlayerSyncEngine(SyncEngine):
                         date_adjustment=pd.Timedelta(days=d),
                         input_fields=p,
                     )
-                    for d in range(-1, 1)
+                    for d in range(-1, 2)
                 ]
                 sync_strategies += [
                     PlayerSyncLayer(
@@ -389,7 +531,7 @@ class PlayerSyncEngine(SyncEngine):
                         swap_birth_month_day=True,
                         input_fields=p,
                     )
-                    for d in range(-1, 1)
+                    for d in range(-1, 2)
                 ]
         else:
             self.verbose_log(
